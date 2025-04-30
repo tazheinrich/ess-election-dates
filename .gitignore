@@ -4,6 +4,9 @@
 .Rproj.user
 .Ruserdata
 
+# Secrets files
+manifesto_apikey.txt
+
 # OS files
 .DS_store
 Thumbs.db

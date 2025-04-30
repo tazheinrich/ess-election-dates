@@ -1,8 +1,10 @@
 # Load packages
+library(countrycode)
 library(here)
+library(manifestoR)
 library(tidyverse)
 
-# Input fieldwork period data
+# Input ESS fieldwork period data
 input <- list(
   list(
     1,
@@ -149,7 +151,7 @@ input <- list(
     7,
     c("AT", "BE", "CZ", "DK",
       "EE", "FI", "FR", "DE",
-      "HU", "IE", "IL", "LI",
+      "HU", "IE", "IL", "LT",
       "NL", "NO", "PL", "PT",
       "SI", "ES", "SE", "CH",
       "GB"),
@@ -170,7 +172,7 @@ input <- list(
     c("AT", "BE", "CZ", "EE",
       "FI", "FR", "DE", "HU",
       "IS", "IE", "IL", "IT",
-      "LI", "NL", "NO", "PL",
+      "LT", "NL", "NO", "PL",
       "PT", "RU", "SI", "ES",
       "SE", "CH", "GB"),
     c("2016-09-19", "2016-09-14", "2016-10-24", "2016-10-01",
@@ -191,7 +193,7 @@ input <- list(
       "HR", "CY", "CZ", "DK",
       "EE", "FI", "FR", "DE",
       "HU", "IS", "IE", "IT",
-      "LV", "LI", "ME", "NL", 
+      "LV", "LT", "ME", "NL", 
       "NO", "PL", "PT", "RS", 
       "SK", "SI", "ES", "SE", 
       "CH", "GB"),
@@ -217,7 +219,7 @@ input <- list(
       "CY", "CZ", "EE", "FI",
       "FR", "DE", "GR", "HU",
       "IS", "IE", "IL", "IT",
-      "LV", "LI", "ME", "NL",
+      "LV", "LT", "ME", "NL",
       "MK", "NO", "PL", "PT",
       "RS", "SK", "SI", "ES",
       "SE", "CH", "GB"),
@@ -242,7 +244,7 @@ input <- list(
     c("AT", "BE", "CY", "CZ",
       "HR", "FI", "FR", "DE",
       "GR", "HU", "IS", "IE",
-      "IT", "LI", "NL", "NO",
+      "IT", "LT", "NL", "NO",
       "PL", "PT", "RS", "SK",
       "SI", "ES", "SE", "CH",
       "GB"),
@@ -262,7 +264,7 @@ input <- list(
       "2023-12-09")))
 
 # Convert to data frame
-df <- map_dfr(input, function(x) {
+fieldwork_dates <- map_dfr(input, function(x) {
   tibble(
     essround = x[[1]],
     cntry = x[[2]],
@@ -271,71 +273,133 @@ df <- map_dfr(input, function(x) {
   )
 })
 
+# Set api key for Manifesto Project
+api_key_file = here("manifesto_apikey.txt")
+mp_setapikey(api_key_file)
+
+# Load Manifesto Project data
+election_dates_mp <- mp_maindataset() %>%
+  # Rename countries to avoid error when converting them to ISO2c
+  mutate(countryname = case_when(countryname == "Northern Ireland" ~ "United Kingdom",
+                                 countryname == "German Democratic Republic" ~ "Germany",
+                                 TRUE ~ countryname),
+         cntry = countrycode(countryname, "country.name", "iso2c"),
+         source = paste("Manifesto Project", datasetversion, sep = " "),
+         election_date = edate) %>%
+  select(cntry, election_date, source) %>%
+  distinct()
+
+# Find election date during fieldwork period
+elections_during <- fieldwork_dates %>% 
+  inner_join(election_dates_mp, by = "cntry", relationship = "many-to-many") %>% 
+  filter(election_date >= field_start & election_date <= field_end) %>%   
+  group_by(essround, cntry, field_start, field_end, source) %>% 
+  summarize(election_date_during_fieldwork = min(election_date), .groups = "drop")
+
+# Find last election before fieldwork period
+last_elections <- fieldwork_dates %>% 
+  inner_join(election_dates_mp, by = "cntry", relationship = "many-to-many") %>% 
+  filter(election_date < field_start) %>% 
+  group_by(essround, cntry, field_start, field_end, source) %>% 
+  summarize(election_date_last_before_fieldwork = max(election_date, na.rm = TRUE), .groups = "drop")
+
+# Merge fieldwork periods with election dates
+df <- fieldwork_dates %>% 
+  left_join(last_elections, by = c("essround", "cntry", "field_start", "field_end")) %>% 
+  left_join(elections_during, by = c("essround", "cntry", "field_start", "field_end")) %>% 
+  mutate(
+    election_flag = case_when(
+      !is.na(election_date_last_before_fieldwork) & !is.na(election_date_during_fieldwork) ~ TRUE,
+      !is.na(election_date_last_before_fieldwork) &  is.na(election_date_during_fieldwork) ~ FALSE
+    ),
+    source = coalesce(source.x, source.y)
+  ) %>% 
+  select(-c(source.x, source.y))
+
 # Define file name including extension
-file_name = "ess_fieldwork_periods.csv"
+file_name = "ess_election_dates.csv"
 
 # Define file path for exporting
 file_path = paste(here(), "data", file_name, sep="/")
 
-# Define function to check for missing values
-check_missing_values <- function(data) {
-  missing_rows <- which(is.na(data), arr.ind = TRUE)
-  if (nrow(missing_rows) > 0) {
-    missing_details <- apply(missing_rows, 1, function(row) {
-      paste(names(data)[row[2]], "is missing in row", row[1])
-    })
-    return(missing_details)
-  }
-  return(NULL)
-}
-
-# Check validity of dates
-check_date_order <- function(data) {
-  if (!inherits(data$field_start, "Date")) {
-    data$field_start <- as.Date(data$field_start)
+# Function to validate ESS data
+validate_ess_data <- function(data) {
+  errors <- c()
+  
+  # Check for missing values
+  required_columns <- c("cntry", "essround", "field_start", "field_end")
+  
+  missing_summary <- sapply(data[required_columns], function(col) sum(is.na(col)))
+  missing_cols <- names(missing_summary[missing_summary > 0])
+  
+  if (length(missing_cols) > 0) {
+    errors <- c(errors, paste0("Missing values in mandatory columns: ", paste(missing_cols, collapse = ", ")))
   }
   
-  if (!inherits(data$field_end, "Date")) {
-    data$field_end <- as.Date(data$field_end)
+  # Check election_flag logic
+  flag_false_with_date <- data %>%
+    filter(election_flag == FALSE & !is.na(election_date_during_fieldwork)) %>%
+    select(cntry, essround)
+  
+  if (nrow(flag_false_with_date) > 0) {
+    rows <- paste0("(", flag_false_with_date$cntry, ", R", flag_false_with_date$essround, ")", collapse = "; ")
+    errors <- c(errors, paste("Rows with election_flag == FALSE but non-NA election_date_during:", rows))
   }
   
-  invalid_dates <- which(data$field_start >= data$field_end)
+  flag_true_without_date <- data %>%
+    filter(election_flag == TRUE & is.na(election_date_during_fieldwork)) %>%
+    select(cntry, essround)
   
-  if (length(invalid_dates) > 0) {
-    return(paste("Invalid date order in row(s):", paste(invalid_dates, collapse = ", ")))
+  if (nrow(flag_true_without_date) > 0) {
+    rows <- paste0("(", flag_true_without_date$cntry, ", R", flag_true_without_date$essround, ")", collapse = "; ")
+    errors <- c(errors, paste("Rows with election_flag == TRUE but missing election_date_during:", rows))
   }
-  return(NULL)
-}
-
-# Check that each (essround, cntry) combination is unique
-check_unique_combinations <- function(data) {
-  duplicate_rows <- data %>%
-    group_by(essround, cntry) %>%
+  
+  # Check date ordering
+  date_order_errors <- data %>%
+    filter(
+      field_start >= field_end |
+        election_date_last_before_fieldwork >= field_start |
+        (election_flag == TRUE & (
+          election_date_during_fieldwork <= field_start | election_date_during_fieldwork >= field_end
+        ))
+    ) %>%
+    select(cntry, essround)
+  
+  if (nrow(date_order_errors) > 0) {
+    rows <- paste0("(", date_order_errors$cntry, ", R", date_order_errors$essround, ")", collapse = "; ")
+    errors <- c(errors, paste("Date ordering issues for: ", rows))
+  }
+  
+  # Check uniqueness
+  duplicate_keys <- data %>%
+    group_by(cntry, essround) %>%
     filter(n() > 1) %>%
-    ungroup()
+    select(cntry, essround) %>%
+    distinct()
   
-  if (nrow(duplicate_rows) > 0) {
-    duplicate_info <- duplicate_rows %>%
-      count(essround, cntry, name = "count") %>%
-      arrange(desc(count))
-    
-    return(paste0("Each ESS round/Country combination should be unique. Duplicates found:\n", 
-                 paste0(duplicate_info$cntry,"/", duplicate_info$essround, " appears ", duplicate_info$count, " times", collapse = "; ")))
+  if (nrow(duplicate_keys) > 0) {
+    rows <- paste0("(", duplicate_keys$cntry, ", R", duplicate_keys$essround, ")", collapse = "; ")
+    errors <- c(errors, paste("Duplicate entries for cntry & essround: ", rows))
   }
-  return(NULL)
+  
+  return(list(success = length(errors) == 0, messages = errors))
 }
 
-# Run checks
-errors <- list(
-  check_missing_values(df),
-  check_date_order(df),
-  check_unique_combinations(df)) %>% 
-  compact()
-
-# Export to CSV
-if (length(errors) > 0) {
-  cat("Errors found:\n", paste0(errors, collapse = "\n"), "\n")
-} else {
-  write_csv(df, file_path)
-  cat("All checks passed. Exporting CSV-file.\n", "File path:", file_path)
+# Separate export function
+export_validated_ess_data <- function(data, export_path = file_path) {
+  validation <- validate_ess_data(data)
+  
+  if (validation$success) {
+    write.csv(data, export_path, row.names = FALSE)
+    message("Data validation successful. Exported to: ", export_path)
+  } else {
+    message("Data validation failed with the following issues:")
+    for (msg in validation$messages) {
+      message("  - ", msg)
+    }
+  }
 }
+
+# Run validation + export
+export_validated_ess_data(df)
